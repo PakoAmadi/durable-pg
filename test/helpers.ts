@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import { Client, type QueryResultRow } from "pg";
 
 export function databaseUrl(): string {
-  const url = process.env.DATABASE_URL;
+  const url = process.env.DATABASE_URL; //DATABASE_URL=postgresql://postgres:postgres@localhost:5432/durable
   if (!url) throw new Error("DATABASE_URL is not set: copy .env.example to .env");
   return url;
 }
