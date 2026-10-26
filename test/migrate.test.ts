@@ -1,7 +1,8 @@
 import { Pool } from "pg";
 import { afterEach, describe, expect, test } from "vitest";
-import { createDurable } from "../src/index.js";
+import {createDurable, DurableError} from "../src/index.js";
 import { databaseUrl, dropSchema, queryRows, uniqueSchema } from "./helpers.js";
+import {migrations} from "../src/migrations.js";
 
 // Acceptance tests for M1 (SPEC.md, section 11).
 
@@ -81,6 +82,34 @@ describe("migrate()", () => {
     const versions = await appliedVersions(schema);
     expect(versions).toEqual(versions.map((_, i) => i + 1));
   });
+
+
+  test("a broken migration rolls back and reports its version", async () => {
+    const schema = newSchema();
+    const durable = createDurable({ connectionString: databaseUrl(), schema });
+
+    migrations.push({ version: 99, sql: (s) => `CREATE TABLE ${s}.oops (id int); SELEC 1;` });
+    try {
+      const error = await durable.migrate().catch((e) => e);
+
+      expect(error).toBeInstanceOf(DurableError);
+      expect(error.message).toBe("migration 99 failed");
+      expect(error.cause.message).toMatch(/syntax error/);
+
+      const [oops] = await queryRows<{ t: string | null }>(
+          "SELECT to_regclass($1) AS t", [`${schema}.oops`],
+      );
+      expect(oops.t).toBeNull();
+
+      expect(await appliedVersions(schema)).not.toContain(99);
+
+      await expect(durable.migrate()).rejects.toThrow("migration 99 failed");
+    } finally {
+      migrations.pop();
+      await durable.shutdown();
+    }
+  });
+
 });
 
 describe("shutdown()", () => {
@@ -97,3 +126,5 @@ describe("shutdown()", () => {
     await pool.end();
   });
 });
+
+

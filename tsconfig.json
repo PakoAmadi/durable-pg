@@ -8,7 +8,8 @@
     "strict": true,
     "noEmit": true,
     "esModuleInterop": true,
-    "skipLibCheck": true
+    "skipLibCheck": true,
+    "verbatimModuleSyntax": true,
   },
   "include": ["src", "test", "playground", "vitest.config.ts"]
 }
