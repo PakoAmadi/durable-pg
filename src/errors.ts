@@ -4,3 +4,6 @@ export class DurableError extends Error {
         this.name = new.target.name
     }
 }
+
+export class DuplicateWorkflowError extends DurableError {}
+export class SerializationError extends DurableError {}
