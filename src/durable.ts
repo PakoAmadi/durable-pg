@@ -7,7 +7,7 @@ import type {
     WorkflowFn,
     WorkflowHandle
 } from "./types.js";
-import {DuplicateWorkflowError, DurableError} from "./errors.js";
+import {DuplicateWorkflowError, DurableError, LeaseLostError} from "./errors.js";
 import {Pool, type PoolClient} from "pg";
 import {migrations} from "./migrations.js";
 import {
@@ -15,13 +15,14 @@ import {
     createSchema,
     ensureMigrationsTable, failWorkflow, getWorkflow,
     insertWorkflow,
-    lockMigration, markRunning,
+    lockMigration,
     unlockMigration,
-    loadSteps, saveStep
+    loadSteps, saveStep, claimWorkflows
 } from "./store.js";
 import {randomUUID} from "node:crypto";
 import { setTimeout as sleep } from "node:timers/promises";
 import {toJson} from "./json.js";
+import { hostname } from "node:os";
 
 export const createDurable = (options: DurableOptions): Durable => {
 
@@ -36,11 +37,21 @@ export const createDurable = (options: DurableOptions): Durable => {
     }
 
     const ownsPool = options.pool === undefined;
+    const executorId = options.executorId ?? `${hostname()}:${process.pid}:${randomUUID().slice(0, 8)}`;
+    const leaseMs = options.leaseMs ?? 30_000;
+    const heartbeatMs = options.heartbeatMs ?? Math.floor(leaseMs / 3);
+    const pollMs = options.pollMs ?? 1_000;
+    const maxConcurrent = options.maxConcurrent ?? 50;
+    const maxRecoveryAttempts = options.maxRecoveryAttempts ?? 10;
+    const hooks = options.testHooks ?? {};
 
     const pool = options.pool ?? new Pool({ connectionString: options.connectionString })
-    const registry = new Map<string, WorkflowFn<any, any>>()
+    const registry = new Map<string, { fn: WorkflowFn<any, any>; version: string }>()
     const running = new Set<Promise<void>>();
 
+    let started = false;
+    let stopping = false;
+    let pollLoop: Promise<void> | undefined;
 
     const lockKey = `durable-pg:migrate:${schema}`;
     const doMigration = async(client: PoolClient, toApply: Migration[], applied: Set<number>) => {
@@ -66,23 +77,44 @@ export const createDurable = (options: DurableOptions): Durable => {
         return { name: 'Error', message: String(e)}
     }
 
+    const launch = (id: string): void => {
+        const run = runWorkflow(id).catch((err) => console.error("durable-pg: runWorkflow failed", id, err));
+        running.add(run);
+        run.finally(() => running.delete(run));
+    };
 
+    const tick = async(): Promise<void> => {
+        const free = maxConcurrent - running.size;
+        if (free <= 0) return;
+        const claimed = await claimWorkflows(pool, schema, {
+            executorId, leaseMs, limit: free, workflows: [...registry].map(([name, w]) => ({ name, version: w.version }))
+        });
+        for (const {id, recoveryAttempts} of claimed) {
+            if (recoveryAttempts > maxRecoveryAttempts) {
+                await failWorkflow(pool, schema, id,  executorId,{ name: "DurableError",  message: `exceeded maxRecoveryAttempts (${maxRecoveryAttempts})`})
+            } else {
+                launch(id);
+            }
+        }
+    }
 
     const runWorkflow = async (id: string): Promise<void> => {
         const row = await getWorkflow(pool, schema, id);
         if (!row || row.status === 'completed' || row.status === 'failed') return;
-        const fn = registry.get(row.name);
+        const fn = registry.get(row.name)?.fn;
         if (!fn) {
             console.warn(`Function doesnt exists! Id: ${id}, WorkflowName: ${row.name}`);
             return;
         }
-        await markRunning(pool, schema, id);
+
         const steps = await loadSteps(pool, schema, id);
         const history = new Map(steps.map((s) => [s.seq, s] as const));
         let nextSeq = 0;
+        const controller = new AbortController();
 
         const ctx: WorkflowContext = {
             workflowId: id,
+            signal: controller.signal,
             step: async <T>(name: string, stepFn: () => Promise<T>): Promise<T> => {
                 const seq = nextSeq++;
 
@@ -92,18 +124,23 @@ export const createDurable = (options: DurableOptions): Durable => {
                     return saved.output as T;
                 }
 
-                //const json = JSON.stringify(await stepFn()) ?? "null";
                 const json = toJson(await stepFn(), `result of step ${name} (seq ${seq})`);
-                await saveStep(pool, schema, { workflow_id: id, seq, name, kind: "step", output: json, error: null });
+                await hooks.beforeCheckpoint?.(id, seq);
+                await saveStep(pool, schema, executorId,{ workflow_id: id, seq, name, kind: "step", output: json, error: null });
+                await hooks.afterCheckpoint?.(id, seq);
                 return JSON.parse(json) as T;
             },
         };
         try {
             const output = await fn(ctx, row.input)
-            await completeWorkflow(pool, schema, id, output);
+            await completeWorkflow(pool, schema, id, executorId, output);
         } catch (e) {
+            if (e instanceof LeaseLostError) {
+                controller.abort(e);
+                return;
+            }
            const error: SerializedError =  serializeError(e);
-           await failWorkflow(pool, schema, id, error)
+           await failWorkflow(pool, schema, id, executorId, error)
         }
 
     }
@@ -119,7 +156,6 @@ export const createDurable = (options: DurableOptions): Durable => {
             await sleep(100)
         }
     }
-
 
     return {
         async migrate(): Promise<void> {
@@ -144,23 +180,41 @@ export const createDurable = (options: DurableOptions): Durable => {
 
         },
         async shutdown() {
+            stopping = true;
+            await pollLoop;
             await Promise.allSettled([...running])
             if (ownsPool) await pool.end();
         },
+        async start(): Promise<void> {
+            if (started) return;
+            started = true;
+            await tick();
+            pollLoop = (async() => {
+                while (!stopping) {
+                    await  sleep(pollMs);
+                    try {
+                        await tick();
+                    } catch (e) {
+                        console.error("durable-pg: poll failed", e);
+                    }
+                }
+            })();
+        },
+
         workflow<I,O>(name: string, fn: WorkflowFn<I, O>, opts?: {version?: string}) {
             if (registry.has(name)) throw new DuplicateWorkflowError(`Workflow ${name} is already registered`)
-            registry.set(name, fn)
             const version = opts?.version ?? "1"
+            registry.set(name, { fn, version })
+
             return {
                 name,
                 async start(input: I, opts?: StartOptions): Promise<WorkflowHandle<O>> {
                     const id = opts?.id ?? randomUUID();
 
                     const inserted = await insertWorkflow(pool, schema, {id, name, input}, version)
-                    if (inserted) {
-                        const run = runWorkflow(id).catch((err) => console.error("durable-pg: runWorkflow failed", id, err));
-                        running.add(run);
-                        run.finally(() => running.delete(run))
+                    if (inserted && running.size < maxConcurrent) {
+                        const claimed = await claimWorkflows(pool, schema, {executorId, leaseMs, limit: 1, workflows: [{name, version}], ids: [id]})
+                        if (claimed.length > 0) launch(id);
                     }
                     return { id, result: () => waitForResult<O>(id) };
                 },

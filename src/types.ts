@@ -3,14 +3,28 @@ import type {Pool, QueryResult, QueryResultRow} from "pg";
 export interface DurableOptions {
     connectionString?: string;
     pool?: Pool;
-    schema?: string;          // по умолчанию "durable"
+    schema?: string;
+    executorId?: string;
+    leaseMs?: number;              // 30_000
+    heartbeatMs?: number;          // leaseMs / 3
+    pollMs?: number;               // 1_000
+    maxConcurrent?: number;        // 50
+    maxRecoveryAttempts?: number;  // 10
+    testHooks?: TestHooks;
+}
+
+export interface TestHooks {
+    beforeCheckpoint?: (workflowId: string, seq: number) => void | Promise<void>;
+    afterCheckpoint?: (workflowId: string, seq: number) => void | Promise<void>;
+    beforeHeartbeat?: () => void | Promise<void>;
 }
 
 export interface Durable {
     migrate(): Promise<void>;
     shutdown(): Promise<void>;
     workflow<I, O>(name: string, fn: WorkflowFn<I, O>, opts?: { version?: string }): Workflow<I, O>;
-    resume(name: string): Promise<void>
+    resume(name: string): Promise<void>;
+    start(): Promise<void>;
 }
 
 export interface Migration {
@@ -27,6 +41,7 @@ export interface Queryable {
 
 export interface WorkflowContext {
     readonly workflowId: string;
+    readonly signal: AbortSignal;
     step<T>(name: string, fn: () => Promise<T>): Promise<T>;
 }
 
