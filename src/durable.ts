@@ -1,7 +1,7 @@
 import type {
     Durable,
     DurableOptions,
-    Migration,  SerializedError,
+    Migration, Run, SerializedError,
     StartOptions,
     WorkflowContext,
     WorkflowFn,
@@ -17,7 +17,7 @@ import {
     insertWorkflow,
     lockMigration,
     unlockMigration,
-    loadSteps, saveStep, claimWorkflows
+    loadSteps, saveStep, claimWorkflows, extendLeases
 } from "./store.js";
 import {randomUUID} from "node:crypto";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -47,11 +47,43 @@ export const createDurable = (options: DurableOptions): Durable => {
 
     const pool = options.pool ?? new Pool({ connectionString: options.connectionString })
     const registry = new Map<string, { fn: WorkflowFn<any, any>; version: string }>()
-    const running = new Set<Promise<void>>();
+    const running = new Map<string, Run>()
 
     let started = false;
     let stopping = false;
     let pollLoop: Promise<void> | undefined;
+    const stopHeartbeat = new AbortController();
+    let heartbeatLoop: Promise<void> | undefined;
+    let reserved = 0;
+
+    const heartbeat = async (): Promise<void> => {
+        if (running.size === 0) return;
+        await hooks.beforeHeartbeat?.();
+        const ids = [...running.keys()];
+        const alive = new Set(await extendLeases(pool, schema, executorId, leaseMs, ids));
+        for (const id of ids) {
+            if (!alive.has(id)) {
+                running.get(id)?.controller.abort(new LeaseLostError(`lease lost on workflow ${id}`));
+            }
+        }
+    };
+
+    const ensureHeartbeat = (): void => {
+        heartbeatLoop ??= (async () => {
+            while (true) {
+                try {
+                    await sleep(heartbeatMs, undefined, { signal: stopHeartbeat.signal });
+                } catch {
+                    return;
+                }
+                try {
+                    await heartbeat();
+                } catch (e) {
+                    console.error("durable-pg: heartbeat failed", e);
+                }
+            }
+        })();
+    };
 
     const lockKey = `durable-pg:migrate:${schema}`;
     const doMigration = async(client: PoolClient, toApply: Migration[], applied: Set<number>) => {
@@ -78,27 +110,50 @@ export const createDurable = (options: DurableOptions): Durable => {
     }
 
     const launch = (id: string): void => {
+        if (running.has(id)) return;
+        const controller = new AbortController();
+        const promise = runWorkflow(id, controller)
+            .catch((err) => console.error("durable-pg: runWorkflow failed", id, err))
+            .finally(() => running.delete(id));
+        running.set(id, { promise, controller });
+        ensureHeartbeat();
+    };
+
+    /*const launch = (id: string): void => {
         const run = runWorkflow(id).catch((err) => console.error("durable-pg: runWorkflow failed", id, err));
         running.add(run);
         run.finally(() => running.delete(run));
+    };*/
+
+    const tick = async (): Promise<void> => {
+        const free = maxConcurrent - running.size - reserved;
+        if (free <= 0) return;
+
+        reserved += free;
+        try {
+            const claimed = await claimWorkflows(pool, schema, {
+                executorId,
+                leaseMs,
+                limit: free,
+                workflows: [...registry].map(([name, w]) => ({ name, version: w.version })),
+            });
+
+            for (const { id, recoveryAttempts } of claimed) {
+                if (recoveryAttempts > maxRecoveryAttempts) {
+                    await failWorkflow(pool, schema, id, executorId, {
+                        name: "DurableError",
+                        message: `exceeded maxRecoveryAttempts (${maxRecoveryAttempts})`,
+                    });
+                } else {
+                    launch(id);
+                }
+            }
+        } finally {
+            reserved -= free;
+        }
     };
 
-    const tick = async(): Promise<void> => {
-        const free = maxConcurrent - running.size;
-        if (free <= 0) return;
-        const claimed = await claimWorkflows(pool, schema, {
-            executorId, leaseMs, limit: free, workflows: [...registry].map(([name, w]) => ({ name, version: w.version }))
-        });
-        for (const {id, recoveryAttempts} of claimed) {
-            if (recoveryAttempts > maxRecoveryAttempts) {
-                await failWorkflow(pool, schema, id,  executorId,{ name: "DurableError",  message: `exceeded maxRecoveryAttempts (${maxRecoveryAttempts})`})
-            } else {
-                launch(id);
-            }
-        }
-    }
-
-    const runWorkflow = async (id: string): Promise<void> => {
+    const runWorkflow = async (id: string, controller: AbortController): Promise<void> => {
         const row = await getWorkflow(pool, schema, id);
         if (!row || row.status === 'completed' || row.status === 'failed') return;
         const fn = registry.get(row.name)?.fn;
@@ -110,12 +165,12 @@ export const createDurable = (options: DurableOptions): Durable => {
         const steps = await loadSteps(pool, schema, id);
         const history = new Map(steps.map((s) => [s.seq, s] as const));
         let nextSeq = 0;
-        const controller = new AbortController();
 
         const ctx: WorkflowContext = {
             workflowId: id,
             signal: controller.signal,
             step: async <T>(name: string, stepFn: () => Promise<T>): Promise<T> => {
+                if (controller.signal.aborted) throw controller.signal.reason;
                 const seq = nextSeq++;
 
                 const saved = history.get(seq);
@@ -182,7 +237,9 @@ export const createDurable = (options: DurableOptions): Durable => {
         async shutdown() {
             stopping = true;
             await pollLoop;
-            await Promise.allSettled([...running])
+            await Promise.allSettled([...running.values()].map((r) => r.promise));
+            stopHeartbeat.abort();
+            await heartbeatLoop;
             if (ownsPool) await pool.end();
         },
         async start(): Promise<void> {
@@ -212,16 +269,23 @@ export const createDurable = (options: DurableOptions): Durable => {
                     const id = opts?.id ?? randomUUID();
 
                     const inserted = await insertWorkflow(pool, schema, {id, name, input}, version)
-                    if (inserted && running.size < maxConcurrent) {
-                        const claimed = await claimWorkflows(pool, schema, {executorId, leaseMs, limit: 1, workflows: [{name, version}], ids: [id]})
-                        if (claimed.length > 0) launch(id);
+                    if (inserted && maxConcurrent - running.size - reserved > 0) {
+                        reserved += 1;
+                        try {
+                            const claimed = await claimWorkflows(pool, schema, {
+                                executorId, leaseMs, limit: 1, workflows: [{ name, version }], ids: [id],
+                            });
+                            if (claimed.length > 0) launch(id);
+                        } finally {
+                            reserved -= 1;
+                        }
                     }
                     return { id, result: () => waitForResult<O>(id) };
                 },
             };
         },
         async resume(id: string): Promise<void> {
-            await  runWorkflow(id);
+            await  runWorkflow(id, new AbortController());
         }
     }
 }

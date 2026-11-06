@@ -114,3 +114,15 @@ export const claimWorkflows = async (
 
     return claimed.rows.map((r) => ({ id: r.id, recoveryAttempts: r.recovery_attempts }));
 };
+
+export const extendLeases = async (
+    db: Queryable, schema: string, executorId: string, leaseMs: number, ids: string[],
+): Promise<string[]> => {
+    const res = await db.query<{ id: string }>(
+        `UPDATE ${schema}.workflows
+            SET lease_until = now() + $2 * interval '1 millisecond', updated_at = now()
+          WHERE id = ANY($3::text[]) AND executor_id = $1 AND status = 'running'
+          RETURNING id`,
+        [executorId, leaseMs, ids]);
+    return res.rows.map((r) => r.id);
+};
