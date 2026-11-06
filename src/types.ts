@@ -96,5 +96,3 @@ export interface StepRow {
     attempts?: number,
     completed_at?: Date,
 }
-
-export interface Run { promise: Promise<void>; controller: AbortController }

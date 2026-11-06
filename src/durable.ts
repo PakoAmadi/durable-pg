@@ -1,28 +1,26 @@
 import type {
     Durable,
     DurableOptions,
-    Migration, Run, SerializedError,
+    Migration,
     StartOptions,
-    WorkflowContext,
     WorkflowFn,
     WorkflowHandle
 } from "./types.js";
-import {DuplicateWorkflowError, DurableError, LeaseLostError} from "./errors.js";
+import {DuplicateWorkflowError, DurableError} from "./errors.js";
 import {Pool, type PoolClient} from "pg";
 import {migrations} from "./migrations.js";
 import {
-    appliedVersions, completeWorkflow,
+    appliedVersions,
     createSchema,
-    ensureMigrationsTable, failWorkflow, getWorkflow,
+    ensureMigrationsTable, getWorkflow,
     insertWorkflow,
     lockMigration,
     unlockMigration,
-    loadSteps, saveStep, claimWorkflows, extendLeases
 } from "./store.js";
 import {randomUUID} from "node:crypto";
 import { setTimeout as sleep } from "node:timers/promises";
-import {toJson} from "./json.js";
 import { hostname } from "node:os";
+import { createExecutor, type Registered } from "./executor.js";
 
 export const createDurable = (options: DurableOptions): Durable => {
 
@@ -37,53 +35,23 @@ export const createDurable = (options: DurableOptions): Durable => {
     }
 
     const ownsPool = options.pool === undefined;
-    const executorId = options.executorId ?? `${hostname()}:${process.pid}:${randomUUID().slice(0, 8)}`;
     const leaseMs = options.leaseMs ?? 30_000;
-    const heartbeatMs = options.heartbeatMs ?? Math.floor(leaseMs / 3);
-    const pollMs = options.pollMs ?? 1_000;
-    const maxConcurrent = options.maxConcurrent ?? 50;
-    const maxRecoveryAttempts = options.maxRecoveryAttempts ?? 10;
-    const hooks = options.testHooks ?? {};
 
     const pool = options.pool ?? new Pool({ connectionString: options.connectionString })
-    const registry = new Map<string, { fn: WorkflowFn<any, any>; version: string }>()
-    const running = new Map<string, Run>()
+    const registry = new Map<string, Registered>()
 
-    let started = false;
-    let stopping = false;
-    let pollLoop: Promise<void> | undefined;
-    const stopHeartbeat = new AbortController();
-    let heartbeatLoop: Promise<void> | undefined;
-    let reserved = 0;
-
-    const heartbeat = async (): Promise<void> => {
-        if (running.size === 0) return;
-        await hooks.beforeHeartbeat?.();
-        const ids = [...running.keys()];
-        const alive = new Set(await extendLeases(pool, schema, executorId, leaseMs, ids));
-        for (const id of ids) {
-            if (!alive.has(id)) {
-                running.get(id)?.controller.abort(new LeaseLostError(`lease lost on workflow ${id}`));
-            }
-        }
-    };
-
-    const ensureHeartbeat = (): void => {
-        heartbeatLoop ??= (async () => {
-            while (true) {
-                try {
-                    await sleep(heartbeatMs, undefined, { signal: stopHeartbeat.signal });
-                } catch {
-                    return;
-                }
-                try {
-                    await heartbeat();
-                } catch (e) {
-                    console.error("durable-pg: heartbeat failed", e);
-                }
-            }
-        })();
-    };
+    const executor = createExecutor({
+        pool,
+        schema,
+        registry,
+        executorId: options.executorId ?? `${hostname()}:${process.pid}:${randomUUID().slice(0, 8)}`,
+        leaseMs,
+        heartbeatMs: options.heartbeatMs ?? Math.floor(leaseMs / 3),
+        pollMs: options.pollMs ?? 1_000,
+        maxConcurrent: options.maxConcurrent ?? 50,
+        maxRecoveryAttempts: options.maxRecoveryAttempts ?? 10,
+        hooks: options.testHooks ?? {},
+    });
 
     const lockKey = `durable-pg:migrate:${schema}`;
     const doMigration = async(client: PoolClient, toApply: Migration[], applied: Set<number>) => {
@@ -100,104 +68,6 @@ export const createDurable = (options: DurableOptions): Durable => {
                 throw new DurableError(`migration ${migration.version} failed`, { cause: e });
             }
         }
-    }
-
-    const serializeError = (e: unknown): SerializedError => {
-        if (e instanceof Error) {
-            return { name: e.name, message: e.message, stack: e.stack }
-        }
-        return { name: 'Error', message: String(e)}
-    }
-
-    const launch = (id: string): void => {
-        if (running.has(id)) return;
-        const controller = new AbortController();
-        const promise = runWorkflow(id, controller)
-            .catch((err) => console.error("durable-pg: runWorkflow failed", id, err))
-            .finally(() => running.delete(id));
-        running.set(id, { promise, controller });
-        ensureHeartbeat();
-    };
-
-    /*const launch = (id: string): void => {
-        const run = runWorkflow(id).catch((err) => console.error("durable-pg: runWorkflow failed", id, err));
-        running.add(run);
-        run.finally(() => running.delete(run));
-    };*/
-
-    const tick = async (): Promise<void> => {
-        const free = maxConcurrent - running.size - reserved;
-        if (free <= 0) return;
-
-        reserved += free;
-        try {
-            const claimed = await claimWorkflows(pool, schema, {
-                executorId,
-                leaseMs,
-                limit: free,
-                workflows: [...registry].map(([name, w]) => ({ name, version: w.version })),
-            });
-
-            for (const { id, recoveryAttempts } of claimed) {
-                if (recoveryAttempts > maxRecoveryAttempts) {
-                    await failWorkflow(pool, schema, id, executorId, {
-                        name: "DurableError",
-                        message: `exceeded maxRecoveryAttempts (${maxRecoveryAttempts})`,
-                    });
-                } else {
-                    launch(id);
-                }
-            }
-        } finally {
-            reserved -= free;
-        }
-    };
-
-    const runWorkflow = async (id: string, controller: AbortController): Promise<void> => {
-        const row = await getWorkflow(pool, schema, id);
-        if (!row || row.status === 'completed' || row.status === 'failed') return;
-        const fn = registry.get(row.name)?.fn;
-        if (!fn) {
-            console.warn(`Function doesnt exists! Id: ${id}, WorkflowName: ${row.name}`);
-            return;
-        }
-
-        const steps = await loadSteps(pool, schema, id);
-        const history = new Map(steps.map((s) => [s.seq, s] as const));
-        let nextSeq = 0;
-
-        const ctx: WorkflowContext = {
-            workflowId: id,
-            signal: controller.signal,
-            step: async <T>(name: string, stepFn: () => Promise<T>): Promise<T> => {
-                if (controller.signal.aborted) throw controller.signal.reason;
-                const seq = nextSeq++;
-
-                const saved = history.get(seq);
-                if (saved) {
-                    if (saved.error) throw new DurableError(saved.error.message, { cause: saved.error });
-                    return saved.output as T;
-                }
-
-                const json = toJson(await stepFn(), `result of step ${name} (seq ${seq})`);
-                await hooks.beforeCheckpoint?.(id, seq);
-                await saveStep(pool, schema, executorId,{ workflow_id: id, seq, name, kind: "step", output: json, error: null });
-                await hooks.afterCheckpoint?.(id, seq);
-                return JSON.parse(json) as T;
-            },
-        };
-        try {
-            const output = await fn(ctx, row.input)
-            await completeWorkflow(pool, schema, id, executorId, output);
-        } catch (e) {
-            if (e instanceof LeaseLostError) {
-                controller.abort(e);
-                return;
-            }
-           const error: SerializedError =  serializeError(e);
-           await failWorkflow(pool, schema, id, executorId, error)
-        }
-
     }
 
     const waitForResult = async<O>(id: string) => {
@@ -226,36 +96,17 @@ export const createDurable = (options: DurableOptions): Durable => {
                 const applied = await appliedVersions(client, schema);
                 const sorted = [...migrations].sort((a, b) => a.version - b.version);
                 await doMigration(client, sorted, applied)
-
-
             } finally {
                 await unlockMigration(client, lockKey);
                 client.release();
             }
-
-        },
-        async shutdown() {
-            stopping = true;
-            await pollLoop;
-            await Promise.allSettled([...running.values()].map((r) => r.promise));
-            stopHeartbeat.abort();
-            await heartbeatLoop;
-            if (ownsPool) await pool.end();
         },
         async start(): Promise<void> {
-            if (started) return;
-            started = true;
-            await tick();
-            pollLoop = (async() => {
-                while (!stopping) {
-                    await  sleep(pollMs);
-                    try {
-                        await tick();
-                    } catch (e) {
-                        console.error("durable-pg: poll failed", e);
-                    }
-                }
-            })();
+            await executor.start();
+        },
+        async shutdown() {
+            await executor.stop();
+            if (ownsPool) await pool.end();
         },
 
         workflow<I,O>(name: string, fn: WorkflowFn<I, O>, opts?: {version?: string}) {
@@ -267,25 +118,14 @@ export const createDurable = (options: DurableOptions): Durable => {
                 name,
                 async start(input: I, opts?: StartOptions): Promise<WorkflowHandle<O>> {
                     const id = opts?.id ?? randomUUID();
-
                     const inserted = await insertWorkflow(pool, schema, {id, name, input}, version)
-                    if (inserted && maxConcurrent - running.size - reserved > 0) {
-                        reserved += 1;
-                        try {
-                            const claimed = await claimWorkflows(pool, schema, {
-                                executorId, leaseMs, limit: 1, workflows: [{ name, version }], ids: [id],
-                            });
-                            if (claimed.length > 0) launch(id);
-                        } finally {
-                            reserved -= 1;
-                        }
-                    }
+                    if (inserted) await executor.claimAndLaunch(1, [id]);
                     return { id, result: () => waitForResult<O>(id) };
                 },
             };
         },
         async resume(id: string): Promise<void> {
-            await  runWorkflow(id, new AbortController());
+            await executor.runWorkflow(id, new AbortController());
         }
     }
 }
