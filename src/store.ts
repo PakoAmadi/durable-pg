@@ -80,6 +80,7 @@ export const claimWorkflows = async (
         limit: number;
         workflows: { name: string; version: string }[];
         ids?: string[];
+        exclude?: string[];
     },
 ): Promise<{ id: string; recoveryAttempts: number }[]> => {
     if (opts.limit <= 0 || opts.workflows.length === 0) return [];
@@ -97,7 +98,8 @@ export const claimWorkflows = async (
                  WHERE status IN ('pending', 'running')
                    AND (lease_until IS NULL OR lease_until < now())
                    AND (name, version) IN (SELECT * FROM unnest($3::text[], $4::text[]))
-                   AND ($6::text[] IS NULL OR id = ANY($6::text[]))
+                   AND ($6::text[] IS NULL OR id = ANY($6::text[])) 
+                   AND NOT (id = ANY($7::text[]))
                  LIMIT $5
                    FOR UPDATE SKIP LOCKED
           )
@@ -108,7 +110,8 @@ export const claimWorkflows = async (
             opts.workflows.map((w) => w.name),       // $3
             opts.workflows.map((w) => w.version),    // $4
             opts.limit,                              // $5
-            opts.ids ?? null,                        // $6: null = без фильтра по id
+            opts.ids ?? null,                        // $6
+            opts.exclude ?? [],
         ],
     );
 

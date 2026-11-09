@@ -93,6 +93,19 @@ describe("claimWorkflows()", () => {
     expect(await claim("B", 3)).toHaveLength(2);
   });
 
+  test("skips the ids it is told to exclude", async () => {
+    for (const id of ["wf-1", "wf-2"]) {
+      await seedWorkflow(schema, { id, name: "hello", status: "running", executorId: "B", leaseInMs: -1_000 });
+    }
+
+    const claimed = await claimWorkflows(pool, schema, {
+      executorId: "B", leaseMs: 30_000, limit: 10, workflows: HELLO, exclude: ["wf-1"],
+    });
+
+    expect(claimed).toEqual([{ id: "wf-2", recoveryAttempts: 1 }]);
+    expect(await ownership(schema, "wf-1")).toMatchObject({ recovery_attempts: 0 });
+  });
+
   test("concurrent claims never hand out the same workflow twice", async () => {
     for (let i = 0; i < 100; i++) await seedWorkflow(schema, { id: `wf-${i}`, name: "hello" });
 

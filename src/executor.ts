@@ -85,7 +85,7 @@ export const createExecutor = (cfg: ExecutorConfig) => {
                 leaseMs,
                 limit: n,
                 workflows: [...registry].map(([name, w]) => ({ name, version: w.version })),
-                ids,
+                ids, exclude: [...running.keys()]
             });
             for (const { id, recoveryAttempts } of claimed) {
                 if (recoveryAttempts > maxRecoveryAttempts) {

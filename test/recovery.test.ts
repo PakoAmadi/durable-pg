@@ -288,6 +288,35 @@ describe("FR-06: heartbeat", () => {
   });
 });
 
+describe("FR-06: a late heartbeat", () => {
+  test("does not make the executor re-claim its own running workflow", async () => {
+    const schema = await newSchema();
+    let heartbeats = 0;
+    // The first heartbeat comes 500 ms late, as if the event loop stalled:
+    // the 300 ms lease expires while the step still runs in this executor,
+    // and its own poll loop sees an expired lease.
+    const a = executor(schema, "A", {
+      testHooks: { beforeHeartbeat: async () => { if (heartbeats++ === 0) await sleep(500); } },
+    });
+    let calls = 0;
+    const wf = a.workflow("slow", async (ctx, _input: null) =>
+      ctx.step("work", async () => {
+        calls++;
+        await sleep(1_000);
+        return "done";
+      }),
+    );
+    await a.start();
+
+    await wf.start(null, { id: "wf-1" });
+    await waitFor(() => statusIs(schema, "wf-1", "completed"), "wf-1 to complete");
+
+    expect(calls).toBe(1);
+    // Nothing crashed, so this is still the first and only attempt.
+    expect(await ownership(schema, "wf-1")).toMatchObject({ executor_id: "A", recovery_attempts: 1 });
+  });
+});
+
 describe("FR-16: graceful shutdown", () => {
   test("waits for a run that finishes within timeoutMs", async () => {
     const schema = await newSchema();
