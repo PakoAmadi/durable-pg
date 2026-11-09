@@ -259,17 +259,20 @@ describe("FR-04: fencing", () => {
 describe("FR-06: heartbeat", () => {
   test("a step that lasts 3 × leaseMs is not taken over", async () => {
     const schema = await newSchema();
+    // A wider gap between heartbeat and lease than FAST: with all test files
+    // running in parallel the event loop can stall for a few hundred ms.
+    const timing = { leaseMs: 1_000, heartbeatMs: 100 };
     const entered = deferred();
     let calls = 0;
     const body = (label: string) => async (ctx: WorkflowContext, _input: null) =>
       ctx.step("slow", async () => {
         calls++;
         entered.resolve();
-        await sleep(3 * FAST.leaseMs);
+        await sleep(3 * timing.leaseMs);
         return label;
       });
-    const a = executor(schema, "A");
-    const b = executor(schema, "B");
+    const a = executor(schema, "A", timing);
+    const b = executor(schema, "B", timing);
     const wf = a.workflow("slow", body("A"));
     b.workflow("slow", body("B"));
 

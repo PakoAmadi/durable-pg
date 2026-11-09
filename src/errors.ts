@@ -8,3 +8,5 @@ export class DurableError extends Error {
 export class DuplicateWorkflowError extends DurableError {}
 export class SerializationError extends DurableError {}
 export class LeaseLostError extends DurableError {}
+export class StepFailedError extends DurableError {}
+export class WorkflowFailedError extends DurableError {}

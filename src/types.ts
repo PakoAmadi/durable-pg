@@ -38,10 +38,23 @@ export interface Queryable {
     ): Promise<QueryResult<R>>;
 }
 
+export interface StepInfo {
+    readonly workflowId: string;
+    readonly seq: number;
+    readonly attempt: number;          // 0 for the first call
+    readonly idempotencyKey: string;   // `${workflowId}:${seq}`, the same in every attempt
+}
+
+export interface StepOptions {
+    retries?: number;       // 0: extra attempts after the first one
+    backoffMs?: number;     // 1_000
+    maxBackoffMs?: number;  // 60_000
+}
+
 export interface WorkflowContext {
     readonly workflowId: string;
     readonly signal: AbortSignal;
-    step<T>(name: string, fn: () => Promise<T>): Promise<T>;
+    step<T>(name: string, fn: (info: StepInfo) => Promise<T>, opts?: StepOptions): Promise<T>;
 }
 
 export type WorkflowFn<I, O> = (ctx: WorkflowContext, input: I) => Promise<O>;

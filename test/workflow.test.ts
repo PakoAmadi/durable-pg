@@ -278,7 +278,9 @@ describe("SerializationError", () => {
     expect(await stepRows(schema, "big-step-1")).toHaveLength(0);
   });
 
-  test("an error thrown by the step itself is not wrapped", async () => {
+  // Since M4 a failing step is wrapped in StepFailedError (FR-07), but its
+  // message still carries the original one.
+  test("an error thrown by the step itself fails the workflow with StepFailedError", async () => {
     const { durable, schema } = await newDurable();
     const wf = durable.workflow("bad-step", async (ctx, _input: null) => {
       return ctx.step("boom", async () => {
@@ -290,7 +292,8 @@ describe("SerializationError", () => {
 
     await expect(handle.result()).rejects.toThrow("boom");
     const [row] = await workflowRows(schema, "bad-step-1");
-    expect(row?.error).toMatchObject({ name: "TypeError", message: "boom" });
+    expect(row?.error?.name).toBe("StepFailedError");
+    expect(row?.error?.message).toContain("boom");
   });
 
   test("a workflow output that cannot be serialized fails the workflow", async () => {

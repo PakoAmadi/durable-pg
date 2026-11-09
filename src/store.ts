@@ -63,10 +63,10 @@ export const loadSteps = async (db:Queryable, schema: string, workflowId: string
 
 export const saveStep = async (db: Queryable, schema: string, executorId: string, stepRow: StepRow) => {
     const res = await db.query(
-        `INSERT INTO ${schema}.steps (workflow_id, seq, name, kind, output, error)
-         SELECT $1, $2, $3, $4, $5, $6
-          WHERE EXISTS (SELECT 1 FROM ${schema}.workflows WHERE id = $1 AND executor_id = $7)`,
-        [stepRow.workflow_id, stepRow.seq, stepRow.name, stepRow.kind, stepRow.output, stepRow.error, executorId]);
+        `INSERT INTO ${schema}.steps (workflow_id, seq, name, kind, output, error, attempts)
+              SELECT $1, $2, $3, $4, $5, $6, $8
+              WHERE EXISTS (SELECT 1 FROM ${schema}.workflows WHERE id = $1 AND executor_id = $7)`,
+        [stepRow.workflow_id, stepRow.seq, stepRow.name, stepRow.kind, stepRow.output, stepRow.error, executorId, stepRow.attempts ?? 1]);
     if (res.rowCount === 0) throw new LeaseLostError(`lease lost on workflow ${stepRow.workflow_id}`);
 };
 

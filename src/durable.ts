@@ -6,7 +6,7 @@ import type {
     WorkflowFn,
     WorkflowHandle
 } from "./types.js";
-import {DuplicateWorkflowError, DurableError} from "./errors.js";
+import {DuplicateWorkflowError, DurableError, WorkflowFailedError} from "./errors.js";
 import {Pool, type PoolClient} from "pg";
 import {migrations} from "./migrations.js";
 import {
@@ -77,7 +77,7 @@ export const createDurable = (options: DurableOptions): Durable => {
                 throw new DurableError(`Workflow ${id} not found`)
             }
             if (row.status === 'completed') return row.output as O;
-            if (row.status === 'failed') throw new DurableError(`workflow ${id} failed: ${row.error?.message ?? "unknown error"}`, { cause: row.error });
+            if (row.status === 'failed') throw new WorkflowFailedError(`workflow ${id} failed: ${row.error?.message ?? "unknown error"}`, { cause: row.error });
             await sleep(100)
         }
     }

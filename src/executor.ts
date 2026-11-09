@@ -1,6 +1,6 @@
 import type { Pool } from "pg";
-import type { SerializedError, TestHooks, WorkflowContext, WorkflowFn } from "./types.js";
-import { DurableError, LeaseLostError } from "./errors.js";
+import type {SerializedError, StepInfo, StepOptions, StepRow, TestHooks, WorkflowContext, WorkflowFn} from "./types.js";
+import {LeaseLostError, StepFailedError} from "./errors.js";
 import {
     claimWorkflows, completeWorkflow, extendLeases, failWorkflow, getWorkflow, loadSteps, releaseLeases, saveStep,
 } from "./store.js";
@@ -33,6 +33,13 @@ const serializeError = (e: unknown): SerializedError => {
     }
     return { name: 'Error', message: String(e)}
 }
+
+const stepFailed = (name: string, seq: number, error: SerializedError) =>
+    new StepFailedError(`step ${name} (seq ${seq}) failed: ${error.message}`, { cause: error });
+
+// backoffMs · 2^attempt, capped at maxBackoffMs, times a random factor in [0.5, 1].
+const backoff = (attempt: number, backoffMs: number, maxBackoffMs: number) =>
+    Math.min(maxBackoffMs, backoffMs * 2 ** attempt) * (0.5 + Math.random() / 2);
 
 export const createExecutor = (cfg: ExecutorConfig) => {
     const { pool, schema, executorId, leaseMs, maxConcurrent, maxRecoveryAttempts, hooks, registry } = cfg;
@@ -97,6 +104,8 @@ export const createExecutor = (cfg: ExecutorConfig) => {
 
     const tick = () => claimAndLaunch(Infinity);
 
+
+
     const runWorkflow = async (id: string, controller: AbortController): Promise<void> => {
         const row = await getWorkflow(pool, schema, id);
         if (!row || row.status === 'completed' || row.status === 'failed') return;
@@ -106,6 +115,13 @@ export const createExecutor = (cfg: ExecutorConfig) => {
             return;
         }
 
+        const checkpoint = async (step: StepRow): Promise<void> => {
+            if (controller.signal.aborted) throw controller.signal.reason;
+            await hooks.beforeCheckpoint?.(id, step.seq);
+            await saveStep(pool, schema, executorId, step);
+            await hooks.afterCheckpoint?.(id, step.seq);
+        };
+
         const steps = await loadSteps(pool, schema, id);
         const history = new Map(steps.map((s) => [s.seq, s] as const));
         let nextSeq = 0;
@@ -113,22 +129,40 @@ export const createExecutor = (cfg: ExecutorConfig) => {
         const ctx: WorkflowContext = {
             workflowId: id,
             signal: controller.signal,
-            step: async <T>(name: string, stepFn: () => Promise<T>): Promise<T> => {
+            step: async <T>(name: string, stepFn: (info: StepInfo) => Promise<T>, opts: StepOptions = {}): Promise<T> => {
                 if (controller.signal.aborted) throw controller.signal.reason;
                 const seq = nextSeq++;
 
                 const saved = history.get(seq);
                 if (saved) {
-                    if (saved.error) throw new DurableError(saved.error.message, { cause: saved.error });
+                    if (saved.error) throw stepFailed(name, seq, saved.error);
                     return saved.output as T;
                 }
 
-                const json = toJson(await stepFn(), `result of step ${name} (seq ${seq})`);
-                if (controller.signal.aborted) throw controller.signal.reason;
-                await hooks.beforeCheckpoint?.(id, seq);
-                await saveStep(pool, schema, executorId,{ workflow_id: id, seq, name, kind: "step", output: json, error: null });
-                await hooks.afterCheckpoint?.(id, seq);
-                return JSON.parse(json) as T;
+                const { retries = 0, backoffMs = 1_000, maxBackoffMs = 60_000 } = opts;
+                for (let attempt = 0; ; attempt++) {
+                    let value: T;
+                    try {
+                        value = await stepFn({ workflowId: id, seq, attempt, idempotencyKey: `${id}:${seq}` });
+                    } catch (e) {
+                        // Lease lost while fn ran: the workflow is not ours, record nothing.
+                        if (controller.signal.aborted) throw controller.signal.reason;
+                        if (attempt < retries) {
+                            // A lost lease aborts the signal and cuts the sleep short.
+                            await sleep(backoff(attempt, backoffMs, maxBackoffMs), undefined, { signal: controller.signal })
+                                .catch(() => { throw controller.signal.reason; });
+                            continue;
+                        }
+                        // The JSON form, exactly what replay will read back.
+                        const error = JSON.parse(JSON.stringify(serializeError(e))) as SerializedError;
+                        await checkpoint({ workflow_id: id, seq, name, kind: "step", output: null, error, attempts: attempt + 1 });
+                        throw stepFailed(name, seq, error);
+                    }
+
+                    const json = toJson(value, `result of step ${name} (seq ${seq})`);
+                    await checkpoint({ workflow_id: id, seq, name, kind: "step", output: json, error: null, attempts: attempt + 1 });
+                    return JSON.parse(json) as T;
+                }
             },
         };
         try {
