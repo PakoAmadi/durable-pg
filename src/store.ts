@@ -126,3 +126,11 @@ export const extendLeases = async (
         [executorId, leaseMs, ids]);
     return res.rows.map((r) => r.id);
 };
+
+
+export const releaseLeases = async (db: Queryable, schema: string, executorId: string, ids: string[]): Promise<void> => {
+    await db.query(
+        `UPDATE ${schema}.workflows SET lease_until = now(), updated_at = now()
+          WHERE id = ANY($2::text[]) AND executor_id = $1 AND status = 'running'`,
+        [executorId, ids]);
+};

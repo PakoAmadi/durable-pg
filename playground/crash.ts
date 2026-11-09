@@ -6,7 +6,8 @@ const schema = "crash_demo";
 const connectionString = process.env.DATABASE_URL!;
 const db = new Pool({ connectionString });
 
-const durable = createDurable({ connectionString, schema });
+// Short lease: after SIGKILL the recover run can take the workflow over in ~2 s, not 30 s.
+const durable = createDurable({ connectionString, schema, leaseMs: 2_000 });
 await durable.migrate();
 await db.query(`CREATE TABLE IF NOT EXISTS ${schema}.side_effects (
     id bigserial PRIMARY KEY, run_id text NOT NULL, step text NOT NULL)`);
@@ -26,12 +27,11 @@ const wf = durable.workflow("crash", async (ctx, _input: null) => {
     return "done";
 });
 
-if (mode === "start") {
-    const handle = await wf.start(null, { id });
-    console.log(await handle.result());
-} else {
-    await durable.resume(id);
-}
+// Recover: start() claims workflows whose executor died once their lease expires.
+if (mode !== "start") await durable.start();
+// For an existing id start() inserts nothing and only returns a handle.
+const handle = await wf.start(null, { id });
+console.log(await handle.result());
 
 const { rows } = await db.query(
     `SELECT step, count(*)::int AS n FROM ${schema}.side_effects WHERE run_id = $1 GROUP BY step ORDER BY step`, [id]);

@@ -1,5 +1,4 @@
 import { afterEach, describe, expect, test } from "vitest";
-// Internal entry point: DurableInternal has resume(id), which index.ts does not export.
 import { createDurable } from "../src/durable.js";
 import { DuplicateWorkflowError, DurableError, SerializationError } from "../src/errors.js";
 import { databaseUrl, dropSchema, queryRows, uniqueSchema } from "./helpers.js";
@@ -63,7 +62,7 @@ async function forgetLastStep(schema: string, id: string): Promise<void> {
     [id],
   );
   await queryRows(
-    `UPDATE "${schema}".workflows SET status = 'running', output = NULL WHERE id = $1`,
+    `UPDATE "${schema}".workflows SET status = 'running', output = NULL, lease_until = NULL WHERE id = $1`,
     [id],
   );
 }
@@ -127,10 +126,10 @@ describe("ctx.step()", () => {
     await handle.result();
     await forgetLastStep(schema, "replay-1");
 
-    await durable.resume("replay-1");
+    await durable.start();
 
-    expect(calls).toEqual({ a: 1, b: 1, c: 2 });
     expect(await handle.result()).toBe("done");
+    expect(calls).toEqual({ a: 1, b: 1, c: 2 });
     expect(await stepRows(schema, "replay-1")).toHaveLength(3);
   });
 
@@ -147,7 +146,8 @@ describe("ctx.step()", () => {
     const handle = await wf.start(null, { id: "clock-1" });
     const first = await handle.result();
     await forgetLastStep(schema, "clock-1");
-    await durable.resume("clock-1");
+    await durable.start();
+    expect(await handle.result()).toBe(first);
 
     // new Date() goes through JSON, so both runs see the same ISO string, not a Date.
     expect(seen).toHaveLength(2);

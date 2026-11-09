@@ -2,11 +2,11 @@ import type { Pool } from "pg";
 import type { SerializedError, TestHooks, WorkflowContext, WorkflowFn } from "./types.js";
 import { DurableError, LeaseLostError } from "./errors.js";
 import {
-    claimWorkflows, completeWorkflow, extendLeases, failWorkflow, getWorkflow, loadSteps, saveStep,
+    claimWorkflows, completeWorkflow, extendLeases, failWorkflow, getWorkflow, loadSteps, releaseLeases, saveStep,
 } from "./store.js";
 import { toJson } from "./json.js";
 import { every } from "./loop.js";
-
+import { setTimeout as sleep } from "node:timers/promises";
 // Everything about running workflows in this process: what is running,
 // how many more fit, claiming, heartbeat and the replay of one workflow.
 
@@ -124,6 +124,7 @@ export const createExecutor = (cfg: ExecutorConfig) => {
                 }
 
                 const json = toJson(await stepFn(), `result of step ${name} (seq ${seq})`);
+                if (controller.signal.aborted) throw controller.signal.reason;
                 await hooks.beforeCheckpoint?.(id, seq);
                 await saveStep(pool, schema, executorId,{ workflow_id: id, seq, name, kind: "step", output: json, error: null });
                 await hooks.afterCheckpoint?.(id, seq);
@@ -144,8 +145,6 @@ export const createExecutor = (cfg: ExecutorConfig) => {
 
     return {
         claimAndLaunch,
-        runWorkflow,
-
         async start(): Promise<void> {
             if (pollLoop) return;
             pollLoop = every(cfg.pollMs, stopPolling.signal, "poll", tick);
@@ -153,12 +152,29 @@ export const createExecutor = (cfg: ExecutorConfig) => {
         },
 
         // Stop claiming, let the running workflows finish, then stop the heartbeat.
-        async stop(): Promise<void> {
+        async stop(timeoutMs: number): Promise<void> {
+            // 1. Claim nothing new.
             stopPolling.abort();
             await pollLoop;
-            await Promise.allSettled([...running.values()].map((r) => r.promise));
+
+            // 2. Let the running workflows finish, but wait at most timeoutMs.
+            //    ref: false — this timer alone must not keep the process alive.
+            await Promise.race([
+                Promise.allSettled([...running.values()].map((r) => r.promise)),
+                sleep(timeoutMs, undefined, { ref: false }),
+            ]);
+
+            // 3. Stop the heartbeat, otherwise it would extend the leases we give back.
             stopHeartbeat.abort();
             await heartbeatLoop;
+
+            // 4. Whatever is still running: stop it and give its lease back.
+            const left = [...running.keys()];
+            if (left.length === 0) return;
+            for (const id of left) {
+                running.get(id)?.controller.abort(new LeaseLostError(`executor ${executorId} shut down`));
+            }
+            await releaseLeases(pool, schema, executorId, left);
         },
     };
 };

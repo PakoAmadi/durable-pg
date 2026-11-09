@@ -104,8 +104,8 @@ export const createDurable = (options: DurableOptions): Durable => {
         async start(): Promise<void> {
             await executor.start();
         },
-        async shutdown() {
-            await executor.stop();
+        async shutdown(opts?: { timeoutMs?: number }) {
+            await executor.stop(opts?.timeoutMs ?? 30_000);
             if (ownsPool) await pool.end();
         },
 
@@ -123,9 +123,6 @@ export const createDurable = (options: DurableOptions): Durable => {
                     return { id, result: () => waitForResult<O>(id) };
                 },
             };
-        },
-        async resume(id: string): Promise<void> {
-            await executor.runWorkflow(id, new AbortController());
         }
     }
 }

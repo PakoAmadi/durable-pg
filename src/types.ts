@@ -21,9 +21,8 @@ export interface TestHooks {
 
 export interface Durable {
     migrate(): Promise<void>;
-    shutdown(): Promise<void>;
+    shutdown(opts?: {timeoutMs?: number}): Promise<void>;
     workflow<I, O>(name: string, fn: WorkflowFn<I, O>, opts?: { version?: string }): Workflow<I, O>;
-    resume(name: string): Promise<void>;
     start(): Promise<void>;
 }
 
